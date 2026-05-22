@@ -1,0 +1,13 @@
+services:
+
+  # Ramp BRC-100 Frontend
+  ramp-brc100:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - VITE_RAMP_API_KEY=${VITE_RAMP_API_KEY}
+    container_name: ramp-brc100
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

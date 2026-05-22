@@ -1,0 +1,16 @@
+services:
+
+  # Ramp BRC-100 Frontend (Development)
+  ramp-brc100-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ramp-brc100-dev
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - VITE_RAMP_API_KEY=${VITE_RAMP_API_KEY}
+    restart: unless-stopped
