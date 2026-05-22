@@ -451,7 +451,7 @@ function App() {
           <span className="conn-dot" /> {connectionLabel}
         </span>
         <h1 className="hero-title">Buy BSV</h1>
-        <p className="hero-sub">Receive with direct instant payments.</p>
+        <p className="hero-sub">Receive direct instant payments.</p>
         <p className="hero-blurb">
           Pay with card or bank, get BSV delivered straight to your wallet.
           No copy-paste addresses — your wallet address rotates per purchase
