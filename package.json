@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@bsv/sdk": "^2.1.2",
+    "@bsv/wallet-relay": "^0.1.1",
     "@ramp-network/ramp-instant-sdk": "^6.2.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"

@@ -1,32 +1,34 @@
 :root {
   --bg: #ffffff;
-  --text: #1a1a1a;
-  --text-m: #6b7280;
-  --border: #e5e4e7;
-  --card-bg: #fafafa;
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --surface: #ffffff;
+  --surface-2: #f7f9f7;
+  --text: #0e1a14;
+  --text-m: #5b6b62;
+  --text-d: #2a3b32;
+  --border: #e3e8e4;
+  --border-strong: #cfd8d2;
+  --accent: #16a34a;
+  --accent-h: #15803d;
+  --accent-soft: rgba(22, 163, 74, 0.1);
+  --accent-line: rgba(22, 163, 74, 0.25);
+  --danger: #b91c1c;
+  --danger-soft: rgba(185, 28, 28, 0.08);
+
+  --sans:
+    'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  font: 16px/1.5 var(--sans);
+  font: 16px/1.55 var(--sans);
   color: var(--text);
   background: var(--bg);
-  color-scheme: light dark;
+  color-scheme: light;
   -webkit-font-smoothing: antialiased;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0a0a0a;
-    --text: #ededed;
-    --text-m: #9ca3af;
-    --border: #2a2a2a;
-    --card-bg: #141414;
-  }
 }
 
 body {
   margin: 0;
   min-height: 100vh;
+  background: var(--bg);
 }
 
 #root {
@@ -37,4 +39,9 @@ h1,
 h2 {
   color: var(--text);
   font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+a {
+  color: var(--accent);
 }
