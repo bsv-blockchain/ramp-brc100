@@ -13,8 +13,11 @@ COPY . .
 # Accept build args for environment variables.
 # NOTE: VITE_* values are inlined into the static bundle at build time and are
 # therefore public. Only pass values intended to be visible client-side.
-ARG VITE_RAMP_API_KEY
-ENV VITE_RAMP_API_KEY=${VITE_RAMP_API_KEY}
+ARG VITE_ONRAMPER_API_KEY
+ENV VITE_ONRAMPER_API_KEY=${VITE_ONRAMPER_API_KEY}
+# Same-origin by default; nginx proxies this path to the signing service.
+ARG VITE_ONRAMPER_SIGN_URL=/api/onramper/sign
+ENV VITE_ONRAMPER_SIGN_URL=${VITE_ONRAMPER_SIGN_URL}
 
 RUN npm run build
 

@@ -1,7 +1,7 @@
 {
   "name": "Buy BSV",
   "short_name": "Buy BSV",
-  "description": "Buy BSV via Ramp and receive directly into your BRC-100 wallet.",
+  "description": "Buy BSV via Onramper and receive directly into your BRC-100 wallet.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#ffffff",

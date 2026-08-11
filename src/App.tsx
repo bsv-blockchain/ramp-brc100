@@ -10,23 +10,39 @@ import {
   type InternalizeActionArgs,
   type InternalizeOutput
 } from '@bsv/sdk'
-import {
-  RampInstantSDK,
-  RampInstantEventTypes,
-  type RampInstantPurchase
-} from '@ramp-network/ramp-instant-sdk'
 import './App.css'
 
 const brc29ProtocolID: WalletProtocol = [2, '3241645161d8']
 const NETWORK: 'mainnet' | 'testnet' = 'mainnet'
 const WOC_BASE = 'https://api.whatsonchain.com'
 const WOC_SEGMENT = NETWORK === 'mainnet' ? 'main' : 'test'
-const RAMP_LABEL = 'ramp.bsvblockchain.tech'
-const DERIVATION_PREFIX = 'ramp'
-const SWAP_ASSET = 'BSV_BSV'
-const PENDING_STORAGE_KEY = 'ramp-brc100:pending'
-const LOG_STORAGE_KEY = 'ramp-brc100:activity'
+const ONRAMPER_LABEL = 'onramper.bsvblockchain.tech'
+const DERIVATION_PREFIX = 'onramper'
+const ONRAMPER_CRYPTO = 'bsv_bsv'
+// `pk_test_` keys are served by the sandbox host; `pk_prod_` by production.
+const WIDGET_BASE = import.meta.env.VITE_ONRAMPER_API_KEY?.startsWith(
+  'pk_test_'
+)
+  ? 'https://buy.onramper.dev'
+  : 'https://buy.onramper.com'
+const LOG_STORAGE_KEY = 'onramper-brc100:activity'
+const IMPORTED_STORAGE_KEY = 'onramper-brc100:imported'
 const POLL_INTERVAL_MS = 8000
+const SIGN_RETRY_MS = 20000
+
+// Onramper theme parameters, mirroring the palette in index.css.
+const WIDGET_THEME: Record<string, string> = {
+  themeName: 'light',
+  containerColor: 'ffffff',
+  primaryColor: '16a34a',
+  secondaryColor: 'f7f9f7',
+  cardColor: 'ffffff',
+  primaryTextColor: '0e1a14',
+  secondaryTextColor: '5b6b62',
+  primaryBtnTextColor: 'ffffff',
+  borderRadius: '0.625rem',
+  wgBorderRadius: '1rem'
+}
 
 const REGION_CURRENCY: Record<string, string> = {
   US: 'USD', GB: 'GBP',
@@ -51,35 +67,19 @@ function detectDefaultCurrency(): string {
   }
 }
 
-function detectVariant(): 'embedded-desktop' | 'embedded-mobile' {
-  if (typeof window === 'undefined') return 'embedded-desktop'
-  return window.matchMedia('(max-width: 600px)').matches
-    ? 'embedded-mobile'
-    : 'embedded-desktop'
-}
-
 type Status =
   | 'idle'
   | 'connecting'
   | 'ready'
-  | 'awaiting-purchase'
-  | 'awaiting-release'
+  | 'watching'
+  | 'detected'
   | 'internalizing'
   | 'imported'
   | 'error'
 
 type LogEntry = { kind: 'info' | 'success' | 'error'; text: string; at: Date }
 
-type PendingPurchase = {
-  id: string
-  apiUrl: string
-  viewToken: string
-  address: string
-  derivationIndex: number
-  fiatValue: string
-  fiatCurrency: string
-  createdAt: string
-}
+type AddressUtxo = { txid: string; confirmed: boolean }
 
 function loadLog(): LogEntry[] {
   try {
@@ -105,19 +105,21 @@ function saveLog(entries: LogEntry[]): void {
   }
 }
 
-function loadPending(): PendingPurchase | null {
+function loadImported(): string[] {
   try {
-    const raw = localStorage.getItem(PENDING_STORAGE_KEY)
-    return raw ? (JSON.parse(raw) as PendingPurchase) : null
+    const raw = localStorage.getItem(IMPORTED_STORAGE_KEY)
+    return raw ? (JSON.parse(raw) as string[]) : []
   } catch {
-    return null
+    return []
   }
 }
 
-function savePending(p: PendingPurchase | null): void {
+function saveImported(txids: string[]): void {
   try {
-    if (p) localStorage.setItem(PENDING_STORAGE_KEY, JSON.stringify(p))
-    else localStorage.removeItem(PENDING_STORAGE_KEY)
+    localStorage.setItem(
+      IMPORTED_STORAGE_KEY,
+      JSON.stringify(txids.slice(-200))
+    )
   } catch {
     // ignore
   }
@@ -138,7 +140,7 @@ async function deriveAddressForIndex(
 
 async function getNextIndex(wallet: WalletClient): Promise<number> {
   const response = await wallet.listActions({
-    labels: [RAMP_LABEL],
+    labels: [ONRAMPER_LABEL],
     labelQueryMode: 'all',
     limit: 1
   })
@@ -149,15 +151,82 @@ async function getNextIndex(wallet: WalletClient): Promise<number> {
   return total
 }
 
-async function fetchPurchase(
-  apiUrl: string,
-  id: string,
-  viewToken: string
-): Promise<RampInstantPurchase | null> {
-  const url = `${apiUrl.replace(/\/+$/, '')}/purchase/${id}?secret=${encodeURIComponent(viewToken)}`
-  const r = await fetch(url)
-  if (!r.ok) return null
-  return (await r.json()) as RampInstantPurchase
+// Onramper exposes no client-side purchase API and the widget emits no
+// events to the host page, so delivery is detected on-chain instead: the
+// derived address is watched for unspent outputs. The split
+// confirmed/unconfirmed endpoints 404 on an address with no history — which
+// is the steady state here — so the combined one is used instead. Mempool
+// entries come back with height 0.
+async function fetchAddressUtxos(address: string): Promise<AddressUtxo[]> {
+  const resp = await fetch(
+    `${WOC_BASE}/v1/bsv/${WOC_SEGMENT}/address/${address}/unspent`
+  )
+  if (!resp.ok) throw new Error(`WoC unspent fetch failed: ${resp.status}`)
+  const utxos = (await resp.json()) as Array<{
+    tx_hash: string
+    height?: number
+  }>
+
+  const found = new Map<string, boolean>()
+  for (const utxo of utxos) {
+    const isConfirmed = (utxo.height ?? 0) > 0
+    found.set(utxo.tx_hash, (found.get(utxo.tx_hash) ?? false) || isConfirmed)
+  }
+  return [...found].map(([txid, confirmed]) => ({ txid, confirmed }))
+}
+
+async function buildWidgetUrl(
+  address: string,
+  fiatCurrency: string,
+  derivationIndex: number,
+  onSignError: (message: string) => void
+): Promise<string> {
+  const apiKey = import.meta.env.VITE_ONRAMPER_API_KEY as string
+
+  // Onramper requires `wallets` to be signed server-side with the project
+  // secret; an unsigned URL still pre-fills the address but is rejected at
+  // checkout. Only the address is sent — the endpoint builds and signs the
+  // content itself, and echoes it back so it can be checked against what
+  // actually goes into the URL.
+  const expectedSignContent = `wallets=${ONRAMPER_CRYPTO}:${address}`
+  let signature: string | null = null
+  const signUrl = import.meta.env.VITE_ONRAMPER_SIGN_URL
+  if (signUrl) {
+    try {
+      const resp = await fetch(signUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ address })
+      })
+      if (!resp.ok) throw new Error(`signing endpoint returned ${resp.status}`)
+      const body = (await resp.json()) as {
+        signature?: string
+        signContent?: string
+      }
+      if (!body.signature)
+        throw new Error('signing endpoint returned no signature')
+      if (body.signContent !== expectedSignContent)
+        throw new Error('signing endpoint signed different content')
+      signature = body.signature
+    } catch (e: unknown) {
+      onSignError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const params = new URLSearchParams({
+    apiKey,
+    mode: 'buy',
+    onlyCryptos: ONRAMPER_CRYPTO,
+    defaultCrypto: ONRAMPER_CRYPTO,
+    wallets: `${ONRAMPER_CRYPTO}:${address}`,
+    defaultFiat: fiatCurrency,
+    hideTopBar: 'true',
+    partnerContext: `brc100:${derivationIndex}`,
+    ...WIDGET_THEME
+  })
+  if (signature) params.set('signature', signature)
+
+  return `${WIDGET_BASE}/?${params.toString()}`
 }
 
 function App() {
@@ -169,13 +238,13 @@ function App() {
   const [log, setLog] = useState<LogEntry[]>(() => loadLog())
   const [logOpen, setLogOpen] = useState(false)
   const [showInstallModal, setShowInstallModal] = useState(false)
-  const [pending, setPending] = useState<PendingPurchase | null>(() =>
-    loadPending()
-  )
+  const [widgetUrl, setWidgetUrl] = useState<string | null>(null)
+  const [signingFailed, setSigningFailed] = useState(false)
+  const [signAttempt, setSignAttempt] = useState(0)
   const [defaultCurrency] = useState<string>(() => detectDefaultCurrency())
 
-  const widgetContainerRef = useRef<HTMLDivElement | null>(null)
-  const rampInstanceRef = useRef<RampInstantSDK | null>(null)
+  const importedRef = useRef<string[]>(loadImported())
+  const importingRef = useRef(false)
 
   const appendLog = useCallback((entry: Omit<LogEntry, 'at'>) => {
     setLog((prev) => {
@@ -224,205 +293,225 @@ function App() {
     }
   }, [appendLog])
 
-  const internalizePurchase = useCallback(
-    async (
-      txid: string,
-      purchaseAddress: string,
-      purchaseIndex: number
-    ) => {
-      if (!wallet) return
+  const rotate = useCallback(
+    async (w: WalletClient) => {
+      const nextI = await getNextIndex(w)
+      const nextAddr = await deriveAddressForIndex(w, nextI)
+      setDerivationIndex(nextI)
+      setAddress(nextAddr)
+      appendLog({ kind: 'info', text: `Rotated to address #${nextI}` })
+    },
+    [appendLog]
+  )
+
+  // Fetch the BEEF for a delivered transaction and internalize every output
+  // paying the derived address. Throws on failure; the caller keeps polling,
+  // because a freshly broadcast transaction has no merkle proof yet.
+  const internalizeDelivery = useCallback(
+    async (txid: string, deliveryAddress: string, deliveryIndex: number) => {
+      if (!wallet) throw new Error('wallet not connected')
       setStatus('internalizing')
       appendLog({ kind: 'info', text: `Fetching BEEF for ${txid}` })
-      const suffix = String(purchaseIndex)
-      try {
-        const resp = await fetch(
-          `${WOC_BASE}/v1/bsv/${WOC_SEGMENT}/tx/${txid}/beef`
-        )
-        if (!resp.ok)
-          throw new Error(`WoC BEEF fetch failed: ${resp.status}`)
-        const beefHex = (await resp.text()).trim()
-        const beef = new Beef()
-        beef.mergeBeef(Utils.toArray(beefHex, 'hex'))
+      const suffix = String(deliveryIndex)
 
-        const atomic = beef.findAtomicTransaction(txid)
-        if (!atomic) throw new Error('Atomic transaction not found in BEEF')
+      const resp = await fetch(
+        `${WOC_BASE}/v1/bsv/${WOC_SEGMENT}/tx/${txid}/beef`
+      )
+      if (!resp.ok) throw new Error(`WoC BEEF fetch failed: ${resp.status}`)
+      const beefHex = (await resp.text()).trim()
+      const beef = new Beef()
+      beef.mergeBeef(Utils.toArray(beefHex, 'hex'))
 
-        const targetScriptHex = new P2PKH().lock(purchaseAddress).toHex()
-        const outputs: InternalizeOutput[] = atomic.outputs
-          .map((out, idx) => ({ out, idx }))
-          .filter(({ out }) => out.lockingScript.toHex() === targetScriptHex)
-          .map(({ idx }) => ({
-            outputIndex: idx,
-            protocol: 'wallet payment' as const,
-            paymentRemittance: {
-              senderIdentityKey: new PrivateKey(1).toPublicKey().toString(),
-              derivationPrefix: DERIVATION_PREFIX,
-              derivationSuffix: suffix
-            }
-          }))
+      const atomic = beef.findAtomicTransaction(txid)
+      if (!atomic) throw new Error('Atomic transaction not found in BEEF')
 
-        if (outputs.length === 0)
-          throw new Error(`No outputs paying ${purchaseAddress} found in tx`)
+      const targetScriptHex = new P2PKH().lock(deliveryAddress).toHex()
+      const outputs: InternalizeOutput[] = atomic.outputs
+        .map((out, idx) => ({ out, idx }))
+        .filter(({ out }) => out.lockingScript.toHex() === targetScriptHex)
+        .map(({ idx }) => ({
+          outputIndex: idx,
+          protocol: 'wallet payment' as const,
+          paymentRemittance: {
+            senderIdentityKey: new PrivateKey(1).toPublicKey().toString(),
+            derivationPrefix: DERIVATION_PREFIX,
+            derivationSuffix: suffix
+          }
+        }))
 
-        const args: InternalizeActionArgs = {
-          tx: atomic.toAtomicBEEF(),
-          description: 'Ramp BSV Purchase',
-          outputs,
-          labels: [
-            RAMP_LABEL,
-            'inbound',
-            purchaseAddress,
-            `ramp-i:${suffix}`,
-            `ts:${Math.floor(Date.now() / 1000)}`
-          ]
-        }
-        const result = await wallet.internalizeAction(args)
-        if (!result?.accepted)
-          throw new Error('internalizeAction not accepted')
+      if (outputs.length === 0)
+        throw new Error(`No outputs paying ${deliveryAddress} found in tx`)
 
-        appendLog({
-          kind: 'success',
-          text: `Imported ${txid} (${outputs.length} output${outputs.length > 1 ? 's' : ''})`
-        })
-
-        savePending(null)
-        setPending(null)
-
-        const nextI = await getNextIndex(wallet)
-        const nextAddr = await deriveAddressForIndex(wallet, nextI)
-        setDerivationIndex(nextI)
-        setAddress(nextAddr)
-        setStatus('imported')
-        appendLog({ kind: 'info', text: `Rotated to address #${nextI}` })
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e)
-        setError(msg)
-        setStatus('error')
-        appendLog({ kind: 'error', text: msg })
+      const args: InternalizeActionArgs = {
+        tx: atomic.toAtomicBEEF(),
+        description: 'Onramper BSV Purchase',
+        outputs,
+        labels: [
+          ONRAMPER_LABEL,
+          'inbound',
+          deliveryAddress,
+          `onramper-i:${suffix}`,
+          `ts:${Math.floor(Date.now() / 1000)}`
+        ]
       }
+      const result = await wallet.internalizeAction(args)
+      if (!result?.accepted) throw new Error('internalizeAction not accepted')
+
+      appendLog({
+        kind: 'success',
+        text: `Imported ${txid} (${outputs.length} output${outputs.length > 1 ? 's' : ''})`
+      })
+
+      importedRef.current = [...importedRef.current, txid]
+      saveImported(importedRef.current)
     },
     [wallet, appendLog]
   )
 
-  // Poll Ramp purchase API while a purchase is pending.
+  // Watch the current derived address for an inbound delivery.
   useEffect(() => {
-    if (!pending || !wallet) return
+    if (!wallet || !address || derivationIndex === null) return
     let cancelled = false
+    const announced = new Set<string>()
 
     const poll = async () => {
+      if (cancelled || importingRef.current) return
+      let utxos: AddressUtxo[]
       try {
-        const purchase = await fetchPurchase(
-          pending.apiUrl,
-          pending.id,
-          pending.viewToken
-        )
-        if (cancelled || !purchase) return
+        utxos = await fetchAddressUtxos(address)
+      } catch {
+        return // transient network failure — keep polling
+      }
+      if (cancelled || utxos.length === 0) return
 
-        if (purchase.finalTxHash) {
-          appendLog({
-            kind: 'success',
-            text: `Ramp released txid ${purchase.finalTxHash}`
-          })
-          void internalizePurchase(
-            purchase.finalTxHash,
-            pending.address,
-            pending.derivationIndex
-          )
-        } else if (purchase.status === 'EXPIRED' || purchase.status === 'CANCELLED') {
-          appendLog({
-            kind: 'error',
-            text: `Purchase ${purchase.status.toLowerCase()}`
-          })
-          savePending(null)
-          setPending(null)
-          setStatus('ready')
+      const fresh = utxos.filter((u) => !importedRef.current.includes(u.txid))
+      if (fresh.length === 0) {
+        // Everything here is already in the wallet — the address was left
+        // behind by an interrupted rotation. Advance past it.
+        importingRef.current = true
+        try {
+          await rotate(wallet)
+        } catch {
+          // retry on the next tick
+        } finally {
+          importingRef.current = false
+        }
+        return
+      }
+
+      for (const utxo of fresh) {
+        if (announced.has(utxo.txid)) continue
+        announced.add(utxo.txid)
+        appendLog({
+          kind: 'info',
+          text: `Detected ${utxo.confirmed ? 'confirmed' : 'unconfirmed'} payment ${utxo.txid}`
+        })
+      }
+      setStatus('detected')
+
+      // Import every delivery sitting at this address before rotating —
+      // nothing brings the watcher back here once the address advances, so a
+      // second purchase made before the first one landed would be stranded.
+      // Confirmed first: unconfirmed transactions have no merkle proof yet
+      // and will just throw.
+      const ordered = [
+        ...fresh.filter((u) => u.confirmed),
+        ...fresh.filter((u) => !u.confirmed)
+      ]
+      importingRef.current = true
+      let allImported = true
+      try {
+        for (const utxo of ordered) {
+          if (cancelled) return
+          try {
+            await internalizeDelivery(utxo.txid, address, derivationIndex)
+          } catch (e: unknown) {
+            // Most failures here are "not confirmed yet". Log and retry on a
+            // later tick; hold the address until everything has landed.
+            allImported = false
+            const msg = e instanceof Error ? e.message : String(e)
+            appendLog({ kind: 'error', text: `Import pending: ${msg}` })
+          }
+        }
+        if (cancelled) return
+        if (allImported) {
+          setStatus('imported')
+          await rotate(wallet)
+        } else {
+          setStatus('detected')
         }
       } catch {
-        // transient failure — keep polling
+        // rotation failed — retry on the next tick
+      } finally {
+        importingRef.current = false
       }
     }
 
-    setStatus(
-      pending.address && pending.id ? 'awaiting-release' : 'awaiting-purchase'
-    )
     void poll()
     const id = window.setInterval(poll, POLL_INTERVAL_MS)
     return () => {
       cancelled = true
       window.clearInterval(id)
     }
-  }, [pending, wallet, appendLog, internalizePurchase])
+  }, [
+    wallet,
+    address,
+    derivationIndex,
+    appendLog,
+    internalizeDelivery,
+    rotate
+  ])
 
-  // Mount Ramp widget inline whenever wallet+address ready and no
-  // pending purchase is awaiting release.
+  // Build the Onramper widget URL for the current address.
   useEffect(() => {
-    if (!address || !widgetContainerRef.current) return
-    if (pending) return
+    if (!address || derivationIndex === null) return
 
-    const apiKey = import.meta.env.VITE_RAMP_API_KEY
-    if (!apiKey) {
+    // The key is inlined at build time, so an unset key means the widget can
+    // never mount — `widgetUrl` simply stays null.
+    if (!import.meta.env.VITE_ONRAMPER_API_KEY) {
       console.warn(
-        '[ramp-brc100] VITE_RAMP_API_KEY is not set — Ramp widget will not mount. Set it in .env to enable purchases.'
+        '[onramper-brc100] VITE_ONRAMPER_API_KEY is not set — the Onramper widget will not mount. Set it in .env to enable purchases.'
       )
       return
     }
 
-    const container = widgetContainerRef.current
-    const ramp = new RampInstantSDK({
-      hostAppName: 'Buy BSV',
-      hostLogoUrl: 'https://desktop.bsvb.tech/icon.png',
-      hostApiKey: apiKey,
-      swapAsset: SWAP_ASSET,
-      defaultAsset: SWAP_ASSET,
-      userAddress: address,
-      fiatCurrency: defaultCurrency,
-      variant: detectVariant(),
-      containerNode: container
-    })
-
-    rampInstanceRef.current = ramp
-
-    ramp.on(RampInstantEventTypes.PURCHASE_CREATED, (event) => {
-      const payload = event.payload as {
-        purchase: RampInstantPurchase
-        purchaseViewToken: string
-        apiUrl: string
-      }
-      const p: PendingPurchase = {
-        id: payload.purchase.id,
-        apiUrl: payload.apiUrl,
-        viewToken: payload.purchaseViewToken,
+    let cancelled = false
+    void (async () => {
+      let failed = false
+      const url = await buildWidgetUrl(
         address,
-        derivationIndex: derivationIndex ?? 0,
-        fiatValue: payload.purchase.fiatValue,
-        fiatCurrency: payload.purchase.fiatCurrency,
-        createdAt: payload.purchase.createdAt
-      }
-      savePending(p)
-      setPending(p)
-      appendLog({
-        kind: 'info',
-        text: `Purchase ${p.id} created (${p.fiatValue} ${p.fiatCurrency})`
-      })
-    })
-
-    ramp.on(RampInstantEventTypes.WIDGET_CLOSE, () => {
-      setStatus((s) => (s === 'awaiting-purchase' ? 'ready' : s))
-    })
-
-    ramp.show()
-    setStatus('awaiting-purchase')
+        defaultCurrency,
+        derivationIndex,
+        (message) => {
+          failed = true
+          appendLog({
+            kind: 'error',
+            text: `Widget URL signing failed (${message}) — checkout will be rejected`
+          })
+        }
+      )
+      if (cancelled) return
+      setSigningFailed(failed)
+      setWidgetUrl(url)
+      setStatus((s) => (s === 'ready' || s === 'imported' ? 'watching' : s))
+    })()
 
     return () => {
-      try {
-        ramp.close()
-      } catch {
-        // ignore teardown errors
-      }
-      rampInstanceRef.current = null
-      container.innerHTML = ''
+      cancelled = true
     }
-  }, [address, defaultCurrency, derivationIndex, pending, appendLog])
+  }, [address, derivationIndex, defaultCurrency, appendLog, signAttempt])
+
+  // An unsigned URL is rejected at Onramper's checkout, and nothing else
+  // retriggers the effect above until the address rotates — which can only
+  // happen after a purchase lands. Retry on a timer instead.
+  useEffect(() => {
+    if (!signingFailed) return
+    const id = window.setTimeout(
+      () => setSignAttempt((n) => n + 1),
+      SIGN_RETRY_MS
+    )
+    return () => window.clearTimeout(id)
+  }, [signingFailed, signAttempt])
 
   useEffect(() => {
     void connect()
@@ -443,6 +532,7 @@ function App() {
       : isConnected
         ? 'Wallet connected'
         : 'Wallet not connected'
+  const isDelivering = status === 'detected' || status === 'internalizing'
 
   return (
     <main className="container">
@@ -455,7 +545,7 @@ function App() {
         <p className="hero-blurb">
           Pay with card or bank, get BSV delivered straight to your wallet.
           No copy-paste addresses — your wallet address rotates per purchase
-          and funds are imported automatically on release.
+          and funds are imported automatically on delivery.
         </p>
       </section>
 
@@ -465,25 +555,60 @@ function App() {
         </section>
       )}
 
-      {pending && (
+      {signingFailed && (
+        <section className="card">
+          <div className="error">
+            Couldn't sign the widget URL, so Onramper will reject the
+            purchase at checkout. Retrying every{' '}
+            {Math.round(SIGN_RETRY_MS / 1000)}s — don't enter payment
+            details until this clears.
+          </div>
+        </section>
+      )}
+
+      {isDelivering && (
         <section className="card pending">
-          <h2>Awaiting release</h2>
+          <h2>
+            {status === 'internalizing' ? 'Importing' : 'Payment detected'}
+          </h2>
           <p className="muted">
-            Purchase {pending.id.slice(0, 8)}… ({pending.fiatValue}{' '}
-            {pending.fiatCurrency}) — waiting for Ramp to broadcast the
-            transaction. Polling every {Math.round(POLL_INTERVAL_MS / 1000)}s.
+            {status === 'internalizing'
+              ? 'Fetching proof and importing the outputs into your wallet.'
+              : 'Waiting for the transaction to confirm so it can be imported. ' +
+                `Checking every ${Math.round(POLL_INTERVAL_MS / 1000)}s.`}
           </p>
         </section>
       )}
 
       <section className="widget-wrapper">
-        <div ref={widgetContainerRef} className="widget-host" />
-        {!address && (
+        {widgetUrl ? (
+          <iframe
+            key={widgetUrl}
+            className="widget-host"
+            src={widgetUrl}
+            title="Onramper widget"
+            allow="accelerometer; autoplay; camera; gyroscope; payment; microphone"
+          />
+        ) : (
           <div className="widget-placeholder">
-            <p className="muted">Connecting to your wallet…</p>
+            <p className="muted">
+              {address
+                ? 'Loading the Onramper widget…'
+                : 'Connecting to your wallet…'}
+            </p>
           </div>
         )}
       </section>
+
+      {widgetUrl && (
+        <p className="muted widget-fallback">
+          Widget not loading?{' '}
+          <a href={widgetUrl} target="_blank" rel="noreferrer noopener">
+            Open Onramper in a new tab
+          </a>
+          .
+        </p>
+      )}
 
       <details
         className="activity"
@@ -531,7 +656,7 @@ function App() {
             <h2 id="install-modal-title">Install BSV Desktop</h2>
             <p className="muted">
               No BSV wallet detected. Install BSV Desktop to derive an
-              address and import your Ramp purchase automatically.
+              address and import your Onramper purchase automatically.
             </p>
             <div className="modal-actions">
               <a

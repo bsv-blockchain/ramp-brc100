@@ -228,37 +228,47 @@ button:disabled {
 }
 
 /* ── Widget host ──────────────────────────────────────────────────────── */
+/* Onramper renders its own ~420px card with its own border and radius, so
+   the host is sized to it — a wider frame just adds dead gutters inside a
+   second border. */
 .widget-wrapper {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  overflow: hidden;
-  min-height: 620px;
   display: flex;
-  flex-direction: column;
+  justify-content: flex-start;
+  min-height: 640px;
   position: relative;
 }
 
 .widget-host {
-  flex: 1;
-  min-height: 620px;
   width: 100%;
-  display: flex;
-}
-
-.widget-host > * {
-  flex: 1;
-  width: 100%;
-  border: 0;
+  max-width: 420px;
+  min-height: 640px;
+  display: block;
+  /* Matches the widget's own wgBorderRadius=1rem, so the two edges align. */
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
 }
 
 .widget-placeholder {
+  width: 100%;
+  max-width: 420px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
   padding: 60px 28px;
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 16px;
   text-align: center;
+}
+
+.widget-fallback {
+  max-width: 420px;
+  text-align: center;
+  font-size: 13px;
+  margin-top: -4px;
 }
 
 .pending {

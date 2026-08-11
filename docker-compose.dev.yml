@@ -1,6 +1,7 @@
 services:
 
-  # Ramp BRC-100 Frontend (Development)
+  # Onramper BRC-100 Frontend (Development). The Vite dev server serves the
+  # signing endpoint itself, so no separate container is needed here.
   ramp-brc100-dev:
     build:
       context: .
@@ -12,5 +13,7 @@ services:
       - .:/app
       - /app/node_modules
     environment:
-      - VITE_RAMP_API_KEY=${VITE_RAMP_API_KEY}
+      - VITE_ONRAMPER_API_KEY=${VITE_ONRAMPER_API_KEY}
+      - VITE_ONRAMPER_SIGN_URL=${VITE_ONRAMPER_SIGN_URL:-/api/onramper/sign}
+      - SIGNING_SECRET=${SIGNING_SECRET}
     restart: unless-stopped
