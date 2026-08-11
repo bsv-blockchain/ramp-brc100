@@ -23,11 +23,13 @@ jobs:
           - name: frontend
             dockerfile: Dockerfile
             suffix: ''
+            scope: frontend
           # Onramper URL signing sidecar. Runs alongside the frontend and is
           # never exposed directly; see server/onramper-sign.js.
           - name: signing service
             dockerfile: Dockerfile.sign
             suffix: '-sign'
+            scope: sign
 
     steps:
       - name: Checkout repository
