@@ -1,8 +1,8 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  readonly VITE_ONRAMPER_API_KEY?: string
-  readonly VITE_ONRAMPER_SIGN_URL?: string
+  readonly VITE_ONRAMP_APP_ID?: string
+  readonly VITE_ONRAMP_SANDBOX?: string
 }
 
 interface ImportMeta {

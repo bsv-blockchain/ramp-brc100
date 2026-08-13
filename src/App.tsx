@@ -10,62 +10,25 @@ import {
   type InternalizeActionArgs,
   type InternalizeOutput
 } from '@bsv/sdk'
+import { OnrampWebSDK } from '@onramp.money/onramp-web-sdk'
 import './App.css'
 
 const brc29ProtocolID: WalletProtocol = [2, '3241645161d8']
 const NETWORK: 'mainnet' | 'testnet' = 'mainnet'
 const WOC_BASE = 'https://api.whatsonchain.com'
 const WOC_SEGMENT = NETWORK === 'mainnet' ? 'main' : 'test'
-const ONRAMPER_LABEL = 'onramper.bsvblockchain.tech'
-const DERIVATION_PREFIX = 'onramper'
-const ONRAMPER_CRYPTO = 'bsv_bsv'
-// `pk_test_` keys are served by the sandbox host; `pk_prod_` by production.
-const WIDGET_BASE = import.meta.env.VITE_ONRAMPER_API_KEY?.startsWith(
-  'pk_test_'
-)
-  ? 'https://buy.onramper.dev'
-  : 'https://buy.onramper.com'
-const LOG_STORAGE_KEY = 'onramper-brc100:activity'
-const IMPORTED_STORAGE_KEY = 'onramper-brc100:imported'
+const ONRAMP_LABEL = 'onramp.bsvblockchain.tech'
+const DERIVATION_PREFIX = 'onramp'
+// From Onramp Money's public config: coin 66 "Bitcoin SV" on network 10535,
+// whose chainSymbol is "bsv".
+// https://api.onramp.money/onramp/api/v2/buy/public/allConfig
+const COIN_CODE = 'bsv'
+const COIN_NETWORK = 'bsv'
+const FLOW_TYPE_BUY = 1
+const WIDGET_CONTAINER_ID = 'onramp-widget'
+const LOG_STORAGE_KEY = 'onramp-brc100:activity'
+const IMPORTED_STORAGE_KEY = 'onramp-brc100:imported'
 const POLL_INTERVAL_MS = 8000
-const SIGN_RETRY_MS = 20000
-
-// Onramper theme parameters, mirroring the palette in index.css.
-const WIDGET_THEME: Record<string, string> = {
-  themeName: 'light',
-  containerColor: 'ffffff',
-  primaryColor: '16a34a',
-  secondaryColor: 'f7f9f7',
-  cardColor: 'ffffff',
-  primaryTextColor: '0e1a14',
-  secondaryTextColor: '5b6b62',
-  primaryBtnTextColor: 'ffffff',
-  borderRadius: '0.625rem',
-  wgBorderRadius: '1rem'
-}
-
-const REGION_CURRENCY: Record<string, string> = {
-  US: 'USD', GB: 'GBP',
-  DE: 'EUR', FR: 'EUR', ES: 'EUR', IT: 'EUR', NL: 'EUR', PT: 'EUR',
-  IE: 'EUR', AT: 'EUR', BE: 'EUR', FI: 'EUR', GR: 'EUR', LU: 'EUR',
-  SK: 'EUR', SI: 'EUR', EE: 'EUR', LT: 'EUR', LV: 'EUR', CY: 'EUR',
-  MT: 'EUR', HR: 'EUR',
-  CA: 'CAD', AU: 'AUD', NZ: 'NZD', JP: 'JPY', CH: 'CHF',
-  SE: 'SEK', NO: 'NOK', DK: 'DKK', PL: 'PLN', CZ: 'CZK', HU: 'HUF',
-  RO: 'RON', BG: 'BGN',
-  IN: 'INR', BR: 'BRL', MX: 'MXN', ZA: 'ZAR', SG: 'SGD', HK: 'HKD',
-  KR: 'KRW', TR: 'TRY', AE: 'AED'
-}
-
-function detectDefaultCurrency(): string {
-  try {
-    const lang = navigator.language || 'en-US'
-    const region = new Intl.Locale(lang).maximize().region ?? ''
-    return REGION_CURRENCY[region] ?? 'USD'
-  } catch {
-    return 'USD'
-  }
-}
 
 type Status =
   | 'idle'
@@ -80,6 +43,15 @@ type Status =
 type LogEntry = { kind: 'info' | 'success' | 'error'; text: string; at: Date }
 
 type AddressUtxo = { txid: string; confirmed: boolean }
+
+// The SDK types every event payload as `object`, so treat the contents as
+// unknown and only read fields defensively.
+type OnrampEvent = { type: string; data: unknown; isOnramp: boolean }
+
+// ONRAMP_WIDGET_TX_SENDING -> "sending"
+function describeTxEvent(type: string): string {
+  return type.replace(/^ONRAMP_WIDGET_TX_/, '').toLowerCase().replace(/_/g, ' ')
+}
 
 function loadLog(): LogEntry[] {
   try {
@@ -140,7 +112,7 @@ async function deriveAddressForIndex(
 
 async function getNextIndex(wallet: WalletClient): Promise<number> {
   const response = await wallet.listActions({
-    labels: [ONRAMPER_LABEL],
+    labels: [ONRAMP_LABEL],
     labelQueryMode: 'all',
     limit: 1
   })
@@ -151,8 +123,8 @@ async function getNextIndex(wallet: WalletClient): Promise<number> {
   return total
 }
 
-// Onramper exposes no client-side purchase API and the widget emits no
-// events to the host page, so delivery is detected on-chain instead: the
+// The widget's transaction events carry no documented payload schema, so
+// delivery is confirmed on-chain rather than taken from the provider: the
 // derived address is watched for unspent outputs. The split
 // confirmed/unconfirmed endpoints 404 on an address with no history — which
 // is the steady state here — so the combined one is used instead. Mempool
@@ -175,60 +147,6 @@ async function fetchAddressUtxos(address: string): Promise<AddressUtxo[]> {
   return [...found].map(([txid, confirmed]) => ({ txid, confirmed }))
 }
 
-async function buildWidgetUrl(
-  address: string,
-  fiatCurrency: string,
-  derivationIndex: number,
-  onSignError: (message: string) => void
-): Promise<string> {
-  const apiKey = import.meta.env.VITE_ONRAMPER_API_KEY as string
-
-  // Onramper requires `wallets` to be signed server-side with the project
-  // secret; an unsigned URL still pre-fills the address but is rejected at
-  // checkout. Only the address is sent — the endpoint builds and signs the
-  // content itself, and echoes it back so it can be checked against what
-  // actually goes into the URL.
-  const expectedSignContent = `wallets=${ONRAMPER_CRYPTO}:${address}`
-  let signature: string | null = null
-  const signUrl = import.meta.env.VITE_ONRAMPER_SIGN_URL
-  if (signUrl) {
-    try {
-      const resp = await fetch(signUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ address })
-      })
-      if (!resp.ok) throw new Error(`signing endpoint returned ${resp.status}`)
-      const body = (await resp.json()) as {
-        signature?: string
-        signContent?: string
-      }
-      if (!body.signature)
-        throw new Error('signing endpoint returned no signature')
-      if (body.signContent !== expectedSignContent)
-        throw new Error('signing endpoint signed different content')
-      signature = body.signature
-    } catch (e: unknown) {
-      onSignError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  const params = new URLSearchParams({
-    apiKey,
-    mode: 'buy',
-    onlyCryptos: ONRAMPER_CRYPTO,
-    defaultCrypto: ONRAMPER_CRYPTO,
-    wallets: `${ONRAMPER_CRYPTO}:${address}`,
-    defaultFiat: fiatCurrency,
-    hideTopBar: 'true',
-    partnerContext: `brc100:${derivationIndex}`,
-    ...WIDGET_THEME
-  })
-  if (signature) params.set('signature', signature)
-
-  return `${WIDGET_BASE}/?${params.toString()}`
-}
-
 function App() {
   const [wallet, setWallet] = useState<WalletClient | null>(null)
   const [address, setAddress] = useState<string | null>(null)
@@ -238,10 +156,6 @@ function App() {
   const [log, setLog] = useState<LogEntry[]>(() => loadLog())
   const [logOpen, setLogOpen] = useState(false)
   const [showInstallModal, setShowInstallModal] = useState(false)
-  const [widgetUrl, setWidgetUrl] = useState<string | null>(null)
-  const [signingFailed, setSigningFailed] = useState(false)
-  const [signAttempt, setSignAttempt] = useState(0)
-  const [defaultCurrency] = useState<string>(() => detectDefaultCurrency())
 
   const importedRef = useRef<string[]>(loadImported())
   const importingRef = useRef(false)
@@ -344,13 +258,13 @@ function App() {
 
       const args: InternalizeActionArgs = {
         tx: atomic.toAtomicBEEF(),
-        description: 'Onramper BSV Purchase',
+        description: 'Onramp BSV Purchase',
         outputs,
         labels: [
-          ONRAMPER_LABEL,
+          ONRAMP_LABEL,
           'inbound',
           deliveryAddress,
-          `onramper-i:${suffix}`,
+          `onramp-i:${suffix}`,
           `ts:${Math.floor(Date.now() / 1000)}`
         ]
       }
@@ -462,56 +376,65 @@ function App() {
     rotate
   ])
 
-  // Build the Onramper widget URL for the current address.
+  // Mount the Onramp Money widget for the current address. Remounted on
+  // rotation so the new address is pre-filled.
   useEffect(() => {
-    if (!address || derivationIndex === null) return
+    if (!address) return
 
-    // The key is inlined at build time, so an unset key means the widget can
-    // never mount — `widgetUrl` simply stays null.
-    if (!import.meta.env.VITE_ONRAMPER_API_KEY) {
+    const rawAppId = import.meta.env.VITE_ONRAMP_APP_ID
+    const appId = Number(rawAppId)
+    if (!rawAppId || !Number.isFinite(appId)) {
       console.warn(
-        '[onramper-brc100] VITE_ONRAMPER_API_KEY is not set — the Onramper widget will not mount. Set it in .env to enable purchases.'
+        '[onramp-brc100] VITE_ONRAMP_APP_ID is not set to a number — the Onramp Money widget will not mount. Set it in .env to enable purchases.'
       )
       return
     }
 
-    let cancelled = false
-    void (async () => {
-      let failed = false
-      const url = await buildWidgetUrl(
-        address,
-        defaultCurrency,
-        derivationIndex,
-        (message) => {
-          failed = true
-          appendLog({
-            kind: 'error',
-            text: `Widget URL signing failed (${message}) — checkout will be rejected`
-          })
+    const sdk = new OnrampWebSDK({
+      appId,
+      walletAddress: address,
+      coinCode: COIN_CODE,
+      network: COIN_NETWORK,
+      flowType: FLOW_TYPE_BUY,
+      containerId: `#${WIDGET_CONTAINER_ID}`,
+      sandbox: import.meta.env.VITE_ONRAMP_SANDBOX === 'true',
+      theme: {
+        default: 'lightMode',
+        lightMode: {
+          baseColor: '#16a34a',
+          inputRadius: '10px',
+          buttonRadius: '10px'
         }
-      )
-      if (cancelled) return
-      setSigningFailed(failed)
-      setWidgetUrl(url)
+      }
+    })
+
+    // Status only — the payload schema is undocumented, so nothing here is
+    // trusted for accounting. The chain watcher above decides what is real.
+    sdk.on('TX_EVENTS', (event: OnrampEvent) => {
+      appendLog({
+        kind: 'info',
+        text: `Onramp: ${describeTxEvent(event.type)}`
+      })
+    })
+
+    sdk.on('WIDGET_EVENTS', (event: OnrampEvent) => {
+      if (event.type === 'ONRAMP_WIDGET_FAILED') {
+        appendLog({ kind: 'error', text: 'Onramp widget failed to load' })
+      }
+    })
+
+    void sdk.show().then(() => {
       setStatus((s) => (s === 'ready' || s === 'imported' ? 'watching' : s))
-    })()
+    })
 
     return () => {
-      cancelled = true
+      try {
+        sdk.close()
+      } catch {
+        // ignore teardown errors
+      }
     }
-  }, [address, derivationIndex, defaultCurrency, appendLog, signAttempt])
-
-  // An unsigned URL is rejected at Onramper's checkout, and nothing else
-  // retriggers the effect above until the address rotates — which can only
-  // happen after a purchase lands. Retry on a timer instead.
-  useEffect(() => {
-    if (!signingFailed) return
-    const id = window.setTimeout(
-      () => setSignAttempt((n) => n + 1),
-      SIGN_RETRY_MS
-    )
-    return () => window.clearTimeout(id)
-  }, [signingFailed, signAttempt])
+  }, [address, appendLog])
 
   useEffect(() => {
     void connect()
@@ -555,17 +478,6 @@ function App() {
         </section>
       )}
 
-      {signingFailed && (
-        <section className="card">
-          <div className="error">
-            Couldn't sign the widget URL, so Onramper will reject the
-            purchase at checkout. Retrying every{' '}
-            {Math.round(SIGN_RETRY_MS / 1000)}s — don't enter payment
-            details until this clears.
-          </div>
-        </section>
-      )}
-
       {isDelivering && (
         <section className="card pending">
           <h2>
@@ -581,34 +493,13 @@ function App() {
       )}
 
       <section className="widget-wrapper">
-        {widgetUrl ? (
-          <iframe
-            key={widgetUrl}
-            className="widget-host"
-            src={widgetUrl}
-            title="Onramper widget"
-            allow="accelerometer; autoplay; camera; gyroscope; payment; microphone"
-          />
-        ) : (
+        <div id={WIDGET_CONTAINER_ID} className="widget-host" />
+        {!address && (
           <div className="widget-placeholder">
-            <p className="muted">
-              {address
-                ? 'Loading the Onramper widget…'
-                : 'Connecting to your wallet…'}
-            </p>
+            <p className="muted">Connecting to your wallet…</p>
           </div>
         )}
       </section>
-
-      {widgetUrl && (
-        <p className="muted widget-fallback">
-          Widget not loading?{' '}
-          <a href={widgetUrl} target="_blank" rel="noreferrer noopener">
-            Open Onramper in a new tab
-          </a>
-          .
-        </p>
-      )}
 
       <details
         className="activity"
@@ -656,7 +547,7 @@ function App() {
             <h2 id="install-modal-title">Install BSV Desktop</h2>
             <p className="muted">
               No BSV wallet detected. Install BSV Desktop to derive an
-              address and import your Onramper purchase automatically.
+              address and import your purchase automatically.
             </p>
             <div className="modal-actions">
               <a

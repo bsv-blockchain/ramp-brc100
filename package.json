@@ -12,6 +12,7 @@
   "dependencies": {
     "@bsv/sdk": "^2.1.2",
     "@bsv/wallet-relay": "^0.1.1",
+    "@onramp.money/onramp-web-sdk": "^2.0.1",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   },

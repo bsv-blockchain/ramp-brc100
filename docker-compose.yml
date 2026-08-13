@@ -1,27 +1,14 @@
 services:
 
-  # Onramper BRC-100 Frontend
+  # Onramp Money BRC-100 Frontend
   ramp-brc100:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        - VITE_ONRAMPER_API_KEY=${VITE_ONRAMPER_API_KEY}
+        - VITE_ONRAMP_APP_ID=${VITE_ONRAMP_APP_ID}
+        - VITE_ONRAMP_SANDBOX=${VITE_ONRAMP_SANDBOX:-}
     container_name: ramp-brc100
     ports:
       - "8080:8080"
-    restart: unless-stopped
-
-  # Signs the widget's `wallets` parameter. Shares the frontend's network
-  # namespace so nginx reaches it on 127.0.0.1:8081 — the same shape as the
-  # sidecar container in the Kubernetes pod, and never reachable from outside.
-  onramper-sign:
-    build:
-      context: .
-      dockerfile: Dockerfile.sign
-    container_name: onramper-sign
-    network_mode: "service:ramp-brc100"
-    environment:
-      - SIGNING_SECRET=${SIGNING_SECRET:?set SIGNING_SECRET in .env}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
     restart: unless-stopped
