@@ -22,7 +22,7 @@ ENV VITE_ONRAMPER_SIGN_URL=${VITE_ONRAMPER_SIGN_URL}
 RUN npm run build
 
 # Stage 3: Serve with nginx
-FROM nginx:1.27-alpine AS runner
+FROM nginx:1.30.7-alpine AS runner
 WORKDIR /usr/share/nginx/html
 
 # Apply security patches available in the base image's package index
