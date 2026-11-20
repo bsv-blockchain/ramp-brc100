@@ -21,7 +21,7 @@ ENV VITE_ONRAMP_SANDBOX=${VITE_ONRAMP_SANDBOX}
 RUN npm run build
 
 # Stage 3: Serve with nginx
-FROM nginx:1.27-alpine AS runner
+FROM nginx:1.30.7-alpine AS runner
 WORKDIR /usr/share/nginx/html
 
 # Apply security patches available in the base image's package index
